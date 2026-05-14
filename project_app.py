@@ -37,7 +37,6 @@ def download_csv():
         "target",
         "summary",
         "matched_reason",
-        "score",
         "url",
     ]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
