@@ -1,6 +1,9 @@
 from services.money_filter import money_keyword_reason
 
 
+MAX_SCORE_HINT = 136
+
+
 def rank_benefits(benefits, user_profile):
     ranked = []
     for benefit in benefits:
@@ -9,7 +12,10 @@ def rank_benefits(benefits, user_profile):
         if score <= 0:
             continue
         scored["score"] = score
-        scored["matched_reason"] = ", ".join(reasons) or "입력 조건과 일부 관련이 있습니다."
+        scored["match_percent"] = min(100, round(score / MAX_SCORE_HINT * 100))
+        scored["match_level"] = _match_level(scored["match_percent"])
+        scored["reason_list"] = reasons or ["입력 조건과 일부 관련이 있습니다."]
+        scored["matched_reason"] = ", ".join(scored["reason_list"])
         ranked.append(scored)
 
     return sorted(ranked, key=lambda item: item.get("score", 0), reverse=True)
@@ -74,11 +80,25 @@ def _score_benefit(benefit, user_profile):
         score += 18
         reasons.append(money_reason)
 
-    if benefit.get("source_type") == "공공기관":
+    source_type = benefit.get("source_type")
+    if source_type == "공공기관":
         score += 10
         reasons.append("공공기관 정책")
+    elif source_type in ("통신사", "카드사"):
+        score += 6
+        reasons.append(f"{source_type} 혜택")
 
     return score, reasons
+
+
+def _match_level(match_percent):
+    if match_percent >= 80:
+        return "매우 적합"
+    if match_percent >= 60:
+        return "적합"
+    if match_percent >= 40:
+        return "참고 가능"
+    return "낮음"
 
 
 def _normalize(value):

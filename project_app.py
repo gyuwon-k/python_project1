@@ -36,6 +36,8 @@ def download_csv():
         "money_type",
         "target",
         "summary",
+        "match_percent",
+        "match_level",
         "matched_reason",
         "url",
     ]
