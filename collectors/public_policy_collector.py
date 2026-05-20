@@ -13,6 +13,8 @@ SAMPLE_PATH = PROJECT_ROOT / "data" / "sample_public_policies.csv"
 
 GOV24_SERVICE_LIST_URL = "https://api.odcloud.kr/api/gov24/v1/serviceList"
 ONTONG_YOUTH_POLICY_URL = "https://www.youthcenter.go.kr/opi/youthPlcyList.do"
+BOKJIRO_LOCAL_BASE_URL = "https://apis.data.go.kr/B554287/LocalGovernmentWelfareInformations"
+BOKJIRO_NATIONAL_BASE_URL = "https://apis.data.go.kr/B554287/NationalWelfareInformationsV001"
 
 
 def get_public_policy_benefits(user_profile):
@@ -22,8 +24,24 @@ def get_public_policy_benefits(user_profile):
     used_sample = False
     ok = False
 
+    bokjiro_key = env.get("BOKJIRO_API_KEY") or env.get("PUBLIC_DATA_API_KEY")
     gov24_key = env.get("GOV24_SERVICE_API_KEY") or env.get("PUBLIC_DATA_API_KEY")
     youth_key = env.get("ONTONG_YOUTH_API_KEY")
+
+    if bokjiro_key:
+        try:
+            collected.extend(_fetch_bokjiro_local_services(env, bokjiro_key, user_profile))
+            ok = True
+            messages.append("복지로 지자체 복지서비스 API를 호출했습니다.")
+        except Exception as exc:
+            messages.append(f"복지로 지자체 API 호출 실패: {exc}")
+
+        try:
+            collected.extend(_fetch_bokjiro_national_services(env, bokjiro_key, user_profile))
+            ok = True
+            messages.append("복지로 중앙부처 복지서비스 API를 호출했습니다.")
+        except Exception as exc:
+            messages.append(f"복지로 중앙부처 API 호출 실패: {exc}")
 
     if gov24_key:
         try:
@@ -41,10 +59,14 @@ def get_public_policy_benefits(user_profile):
         except Exception as exc:
             messages.append(f"온통청년 API 호출 실패: {exc}")
 
+    sample_policies = _load_sample_policies()
     if not collected:
-        collected = _load_sample_policies()
+        collected = sample_policies
         used_sample = True
         messages.append("API 키가 없거나 수집 결과가 없어 샘플 데이터를 사용했습니다.")
+    else:
+        collected = _deduplicate_benefits(collected + sample_policies)
+        messages.append("샘플 데이터도 함께 사용했습니다.")
 
     return collected, {
         "name": "공공기관 금전지원",
@@ -52,6 +74,74 @@ def get_public_policy_benefits(user_profile):
         "used_sample": used_sample,
         "message": " ".join(messages),
     }
+
+
+def _fetch_bokjiro_local_services(env, api_key, user_profile):
+    base_url = env.get("BOKJIRO_LOCAL_BASE_URL", BOKJIRO_LOCAL_BASE_URL).rstrip("/")
+    api_url = f"{base_url}/LcgvWelfarelist"
+    page_size = int(env.get("BOKJIRO_PAGE_SIZE", "30"))
+    params = {
+        "serviceKey": api_key,
+        "pageNo": 1,
+        "numOfRows": page_size,
+        "age": user_profile.get("age", ""),
+        "ctpvNm": _province_full_name(user_profile.get("province", "")),
+        "sggNm": user_profile.get("district", ""),
+        "lifeArray": _life_cycle_code(user_profile.get("age")),
+        "intrsThemaArray": _interest_theme_code(user_profile.get("interest")),
+        "srchKeyCode": "003",
+        "arrgOrd": "001",
+    }
+    raw_items = _request_xml_items(api_url, params)
+    if not raw_items:
+        raw_items = _request_xml_items(
+            api_url,
+            {
+                "serviceKey": api_key,
+                "pageNo": 1,
+                "numOfRows": page_size,
+                "ctpvNm": _province_full_name(user_profile.get("province", "")),
+            },
+        )
+    if not raw_items:
+        raw_items = _request_xml_items(
+            api_url,
+            {
+                "serviceKey": api_key,
+                "pageNo": 1,
+                "numOfRows": page_size,
+                "lifeArray": _life_cycle_code(user_profile.get("age")),
+                "intrsThemaArray": _interest_theme_code(user_profile.get("interest")),
+                "srchKeyCode": "003",
+                "arrgOrd": "001",
+            },
+        )
+    return [_normalize_bokjiro_service(item, user_profile, "지자체") for item in raw_items]
+
+
+def _fetch_bokjiro_national_services(env, api_key, user_profile):
+    base_url = env.get("BOKJIRO_NATIONAL_BASE_URL", BOKJIRO_NATIONAL_BASE_URL).rstrip("/")
+    api_url = f"{base_url}/NationalWelfarelistV001"
+    params = {
+        "serviceKey": api_key,
+        "callTp": "L",
+        "pageNo": 1,
+        "numOfRows": int(env.get("BOKJIRO_PAGE_SIZE", "30")),
+        "srchKeyCode": "001",
+        "age": user_profile.get("age", ""),
+        "lifeArray": _life_cycle_code(user_profile.get("age")),
+        "intrsThemaArray": _interest_theme_code(user_profile.get("interest")),
+        "orderBy": "popular",
+    }
+    raw_items = _request_xml_items(api_url, params)
+    return [_normalize_bokjiro_service(item, user_profile, "중앙부처") for item in raw_items]
+
+
+def _request_xml_items(api_url, params):
+    clean_params = {key: value for key, value in params.items() if value not in (None, "")}
+    response = requests.get(api_url, params=clean_params, timeout=10)
+    response.raise_for_status()
+    return _extract_xml_items(response.text.strip())
 
 
 def _fetch_gov24_services(env, api_key, user_profile):
@@ -90,6 +180,62 @@ def _fetch_youth_policies(env, api_key, user_profile):
         raw_items = _extract_xml_items(text)
 
     return [_normalize_youth_policy(item, user_profile) for item in raw_items]
+
+
+def _normalize_bokjiro_service(item, user_profile, provider_type):
+    title = _pick(item, ["servNm", "serviceNm", "wlfareInfoNm", "서비스명", "title"])
+    provider = _pick(
+        item,
+        ["jurMnofNm", "jurOrgNm", "ctpvNm", "sggNm", "소관기관명"],
+    )
+    summary = _pick(
+        item,
+        [
+            "servDgst",
+            "servDtlCn",
+            "sprtCycNm",
+            "서비스목적요약",
+            "지원내용",
+            "summary",
+        ],
+    )
+    target = _pick(
+        item,
+        ["trgterIndvdlNmArray", "lifeNmArray", "sprtTrgtCn", "지원대상", "target"],
+    )
+    category = _pick(item, ["intrsThemaNmArray", "lifeNmArray", "서비스분야"]) or _infer_category(title, summary)
+    region_text = " ".join(
+        [
+            _pick(item, ["ctpvNm", "시도명"]),
+            _pick(item, ["sggNm", "시군구명"]),
+            provider,
+        ]
+    ).strip()
+    province, district = _extract_region(region_text, user_profile)
+    url = _pick(item, ["servDtlLink", "servLink", "url", "상세조회URL"])
+    age_min, age_max = _parse_age_range(" ".join([target, summary, title]))
+
+    if provider_type == "중앙부처":
+        province = "전국"
+        district = ""
+
+    return {
+        "title": title or f"복지로 {provider_type} 복지서비스",
+        "provider": provider or f"복지로 {provider_type}",
+        "source_type": "공공기관",
+        "category": category or "복지",
+        "province": province,
+        "district": district,
+        "region": _format_region(province, district),
+        "money_type": _infer_money_type(title, summary),
+        "age_min": age_min,
+        "age_max": age_max,
+        "target": target or "복지서비스 대상자",
+        "summary": summary or "복지로 API에서 수집한 복지서비스 정보입니다.",
+        "url": url or "https://www.bokjiro.go.kr",
+        "matched_reason": "",
+        "score": 0,
+    }
 
 
 def _normalize_gov24_service(item, user_profile):
@@ -223,7 +369,7 @@ def _extract_json_items(payload):
 def _extract_xml_items(xml_text):
     root = ET.fromstring(xml_text)
     item_nodes = []
-    for tag in ("youthPolicy", "youthPlcy", "policy", "item", "row", "data"):
+    for tag in ("servList", "youthPolicy", "youthPlcy", "policy", "item", "row", "data"):
         item_nodes.extend(root.findall(f".//{tag}"))
 
     items = []
@@ -248,6 +394,22 @@ def _load_sample_policies():
         row["matched_reason"] = ""
         policies.append(row)
     return policies
+
+
+def _deduplicate_benefits(benefits):
+    deduplicated = []
+    seen = set()
+    for benefit in benefits:
+        key = (
+            benefit.get("title", "").strip(),
+            benefit.get("provider", "").strip(),
+            benefit.get("url", "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(benefit)
+    return deduplicated
 
 
 def _load_env():
@@ -302,6 +464,61 @@ def _province_candidates():
         "경남",
         "제주",
     ]
+
+
+def _province_full_name(province):
+    names = {
+        "서울": "서울특별시",
+        "부산": "부산광역시",
+        "대구": "대구광역시",
+        "인천": "인천광역시",
+        "광주": "광주광역시",
+        "대전": "대전광역시",
+        "울산": "울산광역시",
+        "세종": "세종특별자치시",
+        "경기": "경기도",
+        "강원": "강원특별자치도",
+        "충북": "충청북도",
+        "충남": "충청남도",
+        "전북": "전북특별자치도",
+        "전남": "전라남도",
+        "경북": "경상북도",
+        "경남": "경상남도",
+        "제주": "제주특별자치도",
+    }
+    return names.get(province, province)
+
+
+def _life_cycle_code(age):
+    age = _to_int(age)
+    if age is None:
+        return ""
+    if age <= 6:
+        return "001"
+    if age <= 12:
+        return "002"
+    if age <= 18:
+        return "003"
+    if age <= 34:
+        return "004"
+    if age <= 64:
+        return "005"
+    return "006"
+
+
+def _interest_theme_code(interest):
+    codes = {
+        "생활지원": "030",
+        "주거": "040",
+        "취업": "050",
+        "일자리": "050",
+        "문화": "060",
+        "문화·여가": "060",
+        "교육": "100",
+        "금융": "130",
+        "서민금융": "130",
+    }
+    return codes.get(interest, "")
 
 
 def _format_region(province, district):
